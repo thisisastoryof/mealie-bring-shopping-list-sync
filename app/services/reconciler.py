@@ -140,6 +140,20 @@ class Reconciler:
             log.info("mealie.removed->bring.remove", mealie_id=row.mealie_id)
 
     # ── Bring → Mealie ──────────────────────────────────────────────
+    async def _create_in_mealie(self, b: BringItem, note: str) -> str:
+        """Create a Bring-originated item in Mealie.
+
+        ``BRING_TO_MEALIE=food`` resolves the Bring item name to a Mealie food so
+        Mealie can aggregate it; on no match it falls back to a plain note item
+        (DESIGN.md §5, §11). ``note`` mode always creates a note item.
+        """
+        if settings.bring_to_mealie == "food":
+            food_id = await self.mealie.resolve_food_id(b.name)
+            if food_id:
+                log.info("bring.added->mealie.food", item=b.name)
+                return await self.mealie.add_food_item(food_id=food_id, note=b.spec)
+        return await self.mealie.add_item(note=note)
+
     async def _reconcile_bring_to_mealie(self, db: Session, bring_items: list[BringItem]) -> None:
         seen: set[str] = set()
 
@@ -154,9 +168,9 @@ class Reconciler:
                     db.add(ItemMap(bring_uuid=b.uuid, norm_key=b.norm_key, bring_hash=new_hash))
                     continue
                 # Bring added (no mapping) → create in Mealie.
-                # DESIGN default: plain note item. BRING_TO_MEALIE=food would resolve to a food.
+                # DESIGN default: plain note item. BRING_TO_MEALIE=food resolves to a food.
                 note = f"{b.spec} {b.name}".strip() if b.spec else b.name
-                mealie_id = await self.mealie.add_item(note=note)
+                mealie_id = await self._create_in_mealie(b, note)
                 db.add(
                     ItemMap(mealie_id=mealie_id, bring_uuid=b.uuid, norm_key=b.norm_key, bring_hash=new_hash)
                 )

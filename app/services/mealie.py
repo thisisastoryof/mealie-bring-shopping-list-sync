@@ -125,6 +125,45 @@ class MealieClient:
             return created[0]["id"]
         return data.get("id", "")  # fallback for older Mealie versions
 
+    async def resolve_food_id(self, name: str) -> str | None:
+        """Look up a Mealie food by name; return its id or ``None`` if no exact match.
+
+        Used by ``BRING_TO_MEALIE=food`` (DESIGN.md §5, §11). Matching is on the
+        normalized name so it stays a deterministic, exact resolution — never a
+        fuzzy guess.
+        """
+        target = normalize_name(name)
+        if not target:
+            return None
+        url = f"{_base()}/api/foods"
+        resp = await self._client.get(
+            url, headers=_headers(), params={"search": name, "perPage": 50}, timeout=15
+        )
+        resp.raise_for_status()
+        for food in resp.json().get("items") or []:
+            if normalize_name(food.get("name")) == target:
+                return food.get("id")
+        return None
+
+    async def add_food_item(self, *, food_id: str, note: str = "", quantity: float | None = None) -> str:
+        """Create a food-backed item so Mealie can aggregate it. Returns the new id."""
+        url = f"{_base()}/api/households/shopping/items"
+        payload: dict = {
+            "shoppingListId": settings.mealie_shopping_list_id,
+            "foodId": food_id,
+            "isFood": True,
+            "checked": False,
+            "note": note,
+            "quantity": quantity if quantity is not None else 1,
+        }
+        resp = await self._client.post(url, headers=_headers(), json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        created = data.get("createdItems") or []
+        if created:
+            return created[0]["id"]
+        return data.get("id", "")  # fallback for older Mealie versions
+
     async def set_checked(self, item_id: str, checked: bool) -> None:
         """Toggle an item's checked state.
 
