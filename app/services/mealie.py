@@ -72,6 +72,29 @@ def _parse_dt(value: str | None) -> datetime | None:
         return None
 
 
+def _unit_label(unit, quantity) -> str | None:
+    """Pick the unit string Mealie itself would show.
+
+    Mealie uses the plural form when ``quantity > 1`` and prefers the
+    abbreviation when the unit's ``useAbbreviation`` flag is set. Replicating
+    this keeps the spec pushed to Bring consistent with the Mealie UI (e.g.
+    "2 cups", not "2 cup").
+    """
+    if not isinstance(unit, dict):
+        return unit or None
+    plural = quantity is not None and float(quantity) > 1
+    if unit.get("useAbbreviation"):
+        label = (
+            (unit.get("pluralAbbreviation") if plural else None)
+            or unit.get("abbreviation")
+            or (unit.get("pluralName") if plural else None)
+            or unit.get("name")
+        )
+    else:
+        label = (unit.get("pluralName") if plural else None) or unit.get("name")
+    return label or None
+
+
 def _to_item(raw: dict) -> MealieItem:
     food = raw.get("food") or {}
     unit = raw.get("unit") or {}
@@ -80,7 +103,7 @@ def _to_item(raw: dict) -> MealieItem:
         id=raw["id"],
         display=display,
         quantity=raw.get("quantity"),
-        unit=(unit.get("name") if isinstance(unit, dict) else unit) or None,
+        unit=_unit_label(unit, raw.get("quantity")),
         note=raw.get("note") or None,
         food=(food.get("name") if isinstance(food, dict) else food) or None,
         checked=bool(raw.get("checked")),
