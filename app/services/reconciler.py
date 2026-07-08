@@ -184,8 +184,16 @@ class Reconciler:
                 self._emit("created", "mealie.added->bring", item=m.display)
                 continue
 
+            if row.deleted_at is not None:
+                # The mapping was already torn down (e.g. the Bring side was
+                # removed and, with ON_COMPLETE=check, the Mealie item was only
+                # checked — so it still shows up here). Leave the closed mapping
+                # closed. Reviving it (deleted_at=None) makes the Bring→Mealie
+                # pass re-detect the still-absent Bring item and re-log the exact
+                # same removal on every cycle.
+                continue
+
             row.mealie_id = m.id
-            row.deleted_at = None
 
             # Heal a mapping that lost/never had its Bring side (e.g. a legacy
             # one-sided seed row) so the item finally mirrors across.
