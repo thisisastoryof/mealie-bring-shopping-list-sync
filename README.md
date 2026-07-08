@@ -32,9 +32,9 @@ Mealie shopping list  ⇄  [ sync service + SQLite state ]  ⇄  Bring! list
 
 Runs **headless**: no UI, structured logs, and a `/health` endpoint for the
 Docker healthcheck. Every cycle emits a `cycle.done` heartbeat (item counts +
-duration) so the log proves liveness even when idle; irreversible actions
-(removals/deletes) log at `WARNING`, and each line carries a `cycle_id` so a
-single cycle can be grouped with one `grep`.
+duration) so the log proves liveness even when idle; irreversible deletes are
+tagged `destructive=true` (find them with `grep destructive=true`), and each
+line carries a `cycle_id` so a single cycle can be grouped with one `grep`.
 
 ## Quick start
 

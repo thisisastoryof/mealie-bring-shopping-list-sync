@@ -67,16 +67,19 @@ class Reconciler:
         self.bring = bring
         self._stats: Counter = Counter()
 
-    def _emit(self, bucket: str, event: str, *, warn: bool = False, **fields) -> None:
-        """Count an action for the per-cycle summary and log it.
+    def _emit(self, bucket: str, event: str, *, destructive: bool = False, **fields) -> None:
+        """Count an action for the per-cycle summary and log it at INFO.
 
-        Destructive actions (``warn=True``) are logged at WARNING so they stand
-        out and survive a ``LOG_LEVEL=WARNING`` filter — item removals are the
-        only irreversible operations, and this is the sole visibility a headless
-        service has into them.
+        Every action the reconciler takes is intended, normal behaviour, so it
+        logs at INFO — WARNING/ERROR stay reserved for genuine anomalies (see
+        ``cycle.failed``). Irreversible deletes are tagged ``destructive=True``
+        so they stay findable by field (``grep destructive=true``) without
+        abusing the log level.
         """
         self._stats[bucket] += 1
-        (log.warning if warn else log.info)(event, **fields)
+        if destructive:
+            fields["destructive"] = True
+        log.info(event, **fields)
 
     # ── mapping helpers ─────────────────────────────────────────────
     @staticmethod
@@ -219,8 +222,8 @@ class Reconciler:
             if row.bring_uuid:
                 await self.bring.remove_item(name=row.norm_key, item_uuid=row.bring_uuid)
             row.deleted_at = now
-            # Always a hard delete on the Bring side — irreversible, so WARNING.
-            self._emit("removed", "mealie.removed->bring.remove", warn=True, item=row.norm_key)
+            # Always a hard delete on the Bring side — tag it as irreversible.
+            self._emit("removed", "mealie.removed->bring.remove", item=row.norm_key, destructive=True)
 
     # ── Bring → Mealie ──────────────────────────────────────────────
     async def _create_in_mealie(self, b: BringItem, units: dict[str, str]) -> MealieItem:
@@ -304,7 +307,7 @@ class Reconciler:
                 if settings.on_complete == "delete":
                     await self.mealie.delete_item(row.mealie_id)
                     row.deleted_at = utcnow()
-                    self._emit("updated", "bring.completed->mealie.delete", warn=True, item=b.name)
+                    self._emit("updated", "bring.completed->mealie.delete", item=b.name, destructive=True)
                 else:
                     await self.mealie.set_checked(row.mealie_id, True)
                     self._emit("updated", "bring.completed->mealie.check", item=b.name)
@@ -321,9 +324,9 @@ class Reconciler:
                 else:
                     await self.mealie.set_checked(row.mealie_id, True)
             row.deleted_at = utcnow()
-            # WARNING only when it actually deletes in Mealie; a check is
-            # reversible and part of normal completion, so keep that at INFO.
-            self._emit("removed", "bring.removed->mealie", warn=deleted, item=row.norm_key)
+            # Tag as destructive only when it actually deletes in Mealie; a
+            # check is reversible and part of normal completion.
+            self._emit("removed", "bring.removed->mealie", item=row.norm_key, destructive=deleted)
 
 
 
