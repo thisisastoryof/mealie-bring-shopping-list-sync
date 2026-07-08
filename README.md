@@ -77,7 +77,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `FRESHNESS_DEBOUNCE_SECONDS` | `5`             | Skip items edited within this window (mid-edit).            |
 | `QUIET_HOURS`                | _(off)_         | Suspend polling in a local-time window, e.g. `23:00-07:00`. |
 | `DB_PATH`                    | `/data/sync.db` | SQLite state store path.                                    |
-| `LOG_LEVEL`                  | `INFO`          | Log verbosity.                                              |
+| `LOG_LEVEL`                  | `INFO`          | Log verbosity. `DEBUG` also traces every HTTP request.      |
 
 ## Status
 

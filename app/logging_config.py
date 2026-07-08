@@ -15,6 +15,13 @@ def configure_logging() -> None:
 
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
 
+    # httpx/httpcore emit one INFO line per HTTP request. Next to our structured
+    # action logs that's just transport noise, so silence them unless the app is
+    # explicitly in DEBUG (where the request trace is useful for troubleshooting).
+    http_level = logging.DEBUG if level <= logging.DEBUG else logging.WARNING
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(http_level)
+
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
