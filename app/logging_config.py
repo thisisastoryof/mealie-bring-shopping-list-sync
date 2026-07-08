@@ -15,12 +15,14 @@ def configure_logging() -> None:
 
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
 
-    # httpx/httpcore emit one INFO line per HTTP request. Next to our structured
-    # action logs that's just transport noise, so silence them unless the app is
-    # explicitly in DEBUG (where the request trace is useful for troubleshooting).
-    http_level = logging.DEBUG if level <= logging.DEBUG else logging.WARNING
-    for noisy in ("httpx", "httpcore"):
-        logging.getLogger(noisy).setLevel(http_level)
+    # Framework transport noise: httpx/httpcore emit one line per HTTP request,
+    # and uvicorn.access emits one per inbound request (dominated by the Docker
+    # healthcheck polling /health). Next to our structured action logs that's
+    # just noise, so silence it unless the app is explicitly in DEBUG (where the
+    # per-request trace is useful for troubleshooting).
+    noisy_level = logging.DEBUG if level <= logging.DEBUG else logging.WARNING
+    for noisy in ("httpx", "httpcore", "uvicorn.access"):
+        logging.getLogger(noisy).setLevel(noisy_level)
 
     structlog.configure(
         processors=[
