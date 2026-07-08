@@ -219,7 +219,8 @@ class Reconciler:
             if row.bring_uuid:
                 await self.bring.remove_item(name=row.norm_key, item_uuid=row.bring_uuid)
             row.deleted_at = now
-            self._emit("removed", "mealie.removed->bring.remove", warn=True, mealie_id=row.mealie_id)
+            # Always a hard delete on the Bring side — irreversible, so WARNING.
+            self._emit("removed", "mealie.removed->bring.remove", warn=True, item=row.norm_key)
 
     # ── Bring → Mealie ──────────────────────────────────────────────
     async def _create_in_mealie(self, b: BringItem, units: dict[str, str]) -> MealieItem:
@@ -313,13 +314,16 @@ class Reconciler:
         for row in db.scalars(select(ItemMap).where(ItemMap.bring_uuid.is_not(None))).all():
             if row.bring_uuid in seen or row.deleted_at is not None:
                 continue
+            deleted = settings.on_complete == "delete"
             if row.mealie_id:
-                if settings.on_complete == "delete":
+                if deleted:
                     await self.mealie.delete_item(row.mealie_id)
                 else:
                     await self.mealie.set_checked(row.mealie_id, True)
             row.deleted_at = utcnow()
-            self._emit("removed", "bring.removed->mealie", warn=True, bring_uuid=row.bring_uuid)
+            # WARNING only when it actually deletes in Mealie; a check is
+            # reversible and part of normal completion, so keep that at INFO.
+            self._emit("removed", "bring.removed->mealie", warn=deleted, item=row.norm_key)
 
 
 
