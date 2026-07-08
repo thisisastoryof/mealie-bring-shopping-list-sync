@@ -2,13 +2,17 @@
 
 Each cycle:
   1. Fetch the Mealie list and the Bring list (purchase + recently).
-  2. Classify each side against its stored hash.
-  3. Apply only *transitions* — never re-derive actions from the raw snapshot.
+  2. Link the two sides by stable id (``mealie_id`` <-> ``bring_uuid``), falling
+     back to normalized name to *merge* pre-existing items instead of duplicating.
+  3. Heal one-sided mappings (create the missing counterpart) and apply only
+     *transitions* against the stored per-side hash.
   4. Persist new hashes / mappings / tombstones.
 
-The whole point of diffing against **stored** state (not the live snapshot) is
-that a lingering completed/removed item is actioned exactly once, which is what
-made the old Home-Assistant approach unfixable.
+Diffing against **stored** state (not the live snapshot) is what makes a
+lingering completed/removed item act exactly once — the failure that made the
+old Home-Assistant approach unfixable. Both hashes are written whenever a
+mapping is created or linked, so an item never immediately round-trips back to
+the side it came from.
 """
 import asyncio
 
@@ -20,23 +24,37 @@ from app.config import settings
 from app.database import SessionLocal
 from app.health import health
 from app.logging_config import get_logger
-from app.models import ItemMap, Meta
+from app.models import ItemMap
 from app.services.bring import BringClient, BringItem
 from app.services.mealie import MealieClient, MealieItem
-from app.utils import is_quiet_now, stable_hash, utcnow
+from app.utils import is_quiet_now, normalize_name, parse_quantity, stable_hash, utcnow
 
 log = get_logger(__name__)
-
-# Meta key marking that first-run seeding has completed. Persisted so seeding
-# runs exactly once for the lifetime of the state store, not on every process
-# start (otherwise a restart re-inserts existing mappings -> UNIQUE violation).
-SEEDED_KEY = "seeded_at"
 
 
 def _mealie_hash(item: MealieItem) -> str:
     return stable_hash(
         {"checked": item.checked, "quantity": item.quantity, "unit": item.unit, "note": item.note}
     )
+
+
+def _bring_hash(*, completed: bool, spec: str) -> str:
+    return stable_hash({"completed": completed, "spec": spec})
+
+
+def _split_unit(remainder: str, units: dict[str, str]) -> tuple[str | None, str]:
+    """Resolve the first token of ``remainder`` against Mealie's units.
+
+    Returns ``(unit_id, leftover_note)``. If the leading token is not a known
+    Mealie unit, nothing is consumed and the remainder is returned unchanged.
+    """
+    if not remainder:
+        return None, ""
+    token, _, rest = remainder.partition(" ")
+    unit_id = units.get(normalize_name(token))
+    if unit_id:
+        return unit_id, rest.strip()
+    return None, remainder
 
 
 class Reconciler:
@@ -65,44 +83,33 @@ class Reconciler:
     async def run_cycle(self) -> None:
         mealie_items = await self.mealie.fetch_items()
         bring_items = await self.bring.fetch_items()
+        # Mealie unit vocabulary — only needed to resolve Bring specs to foods.
+        units = await self.mealie.fetch_units() if settings.bring_to_mealie == "food" else {}
 
         db = SessionLocal()
         try:
-            if db.get(Meta, SEEDED_KEY) is None:
-                self._seed(db, mealie_items, bring_items)
-                db.add(Meta(key=SEEDED_KEY, value=utcnow().isoformat()))
-            else:
-                await self._reconcile_mealie_to_bring(db, mealie_items)
-                await self._reconcile_bring_to_mealie(db, bring_items)
+            await self._reconcile_mealie_to_bring(db, mealie_items, bring_items)
+            await self._reconcile_bring_to_mealie(db, bring_items, mealie_items, units)
             db.commit()
         finally:
             db.close()
 
-    # ── first run: mark everything known, create no side effects ────
-    def _seed(self, db: Session, mealie_items: list[MealieItem], bring_items: list[BringItem]) -> None:
-        log.info("seed.start", mealie=len(mealie_items), bring=len(bring_items))
-        existing_mealie = set(db.scalars(select(ItemMap.mealie_id).where(ItemMap.mealie_id.is_not(None))))
-        existing_bring = set(db.scalars(select(ItemMap.bring_uuid).where(ItemMap.bring_uuid.is_not(None))))
-        by_norm: dict[str, ItemMap] = {}
-        for m in mealie_items:
-            if m.id in existing_mealie:
-                continue
-            row = ItemMap(mealie_id=m.id, norm_key=m.norm_key, mealie_hash=_mealie_hash(m))
-            db.add(row)
-            by_norm[m.norm_key] = row
-        for b in bring_items:
-            if b.uuid in existing_bring:
-                continue
-            row = by_norm.get(b.norm_key)
-            if row is not None and row.bring_uuid is None:
-                row.bring_uuid = b.uuid
-                row.bring_hash = b.content_hash()
-            else:
-                db.add(ItemMap(bring_uuid=b.uuid, norm_key=b.norm_key, bring_hash=b.content_hash()))
-        log.info("seed.done")
-
     # ── Mealie → Bring ──────────────────────────────────────────────
-    async def _reconcile_mealie_to_bring(self, db: Session, mealie_items: list[MealieItem]) -> None:
+    async def _create_in_bring(self, m: MealieItem) -> tuple[str, str]:
+        """Create a Bring item mirroring ``m``. Returns ``(uuid, bring_hash)``."""
+        spec = m.spec()
+        uuid = await self.bring.add_item(name=m.food or m.note or m.display, spec=spec)
+        return uuid, _bring_hash(completed=False, spec=spec)
+
+    async def _reconcile_mealie_to_bring(
+        self, db: Session, mealie_items: list[MealieItem], bring_items: list[BringItem]
+    ) -> None:
+        # Live Bring items by name, used to *merge* an existing Bring twin
+        # instead of creating a duplicate (first-run / pre-existing items).
+        bring_by_norm: dict[str, BringItem] = {}
+        for b in bring_items:
+            bring_by_norm.setdefault(b.norm_key, b)
+
         seen: set[str] = set()
         now = utcnow()
 
@@ -119,26 +126,51 @@ class Reconciler:
             row = self._by_mealie(db, m.id) or self._by_norm(db, m.norm_key)
 
             if row is None:
-                # Mealie added → create in Bring.
-                uuid = await self.bring.add_item(name=m.food or m.note or m.display, spec=m.spec())
-                db.add(ItemMap(mealie_id=m.id, bring_uuid=uuid, norm_key=m.norm_key, mealie_hash=new_hash))
+                twin = bring_by_norm.get(m.norm_key)
+                if twin is not None and self._by_bring(db, twin.uuid) is None:
+                    # Same item already on both sides → link, no side effect.
+                    db.add(ItemMap(
+                        mealie_id=m.id, bring_uuid=twin.uuid, norm_key=m.norm_key,
+                        mealie_hash=new_hash, bring_hash=twin.content_hash(),
+                    ))
+                    log.info("link.mealie+bring", item=m.display)
+                    continue
+                uuid, bhash = await self._create_in_bring(m)
+                db.add(ItemMap(
+                    mealie_id=m.id, bring_uuid=uuid, norm_key=m.norm_key,
+                    mealie_hash=new_hash, bring_hash=bhash,
+                ))
                 log.info("mealie.added->bring", item=m.display)
                 continue
 
             row.mealie_id = m.id
             row.deleted_at = None
-            if row.mealie_hash == new_hash:
-                continue  # unchanged transition-wise
 
-            # Determine which transition happened.
-            if m.checked and row.bring_uuid:
+            # Heal a mapping that lost/never had its Bring side (e.g. a legacy
+            # one-sided seed row) so the item finally mirrors across.
+            if row.bring_uuid is None:
+                twin = bring_by_norm.get(m.norm_key)
+                if twin is not None and self._by_bring(db, twin.uuid) is None:
+                    row.bring_uuid = twin.uuid
+                    row.bring_hash = twin.content_hash()
+                    log.info("heal.link_bring", item=m.display)
+                else:
+                    row.bring_uuid, row.bring_hash = await self._create_in_bring(m)
+                    log.info("heal.create_bring", item=m.display)
+                row.mealie_hash = new_hash
+                continue
+
+            if row.mealie_hash == new_hash:
+                continue  # no transition
+
+            if m.checked:
                 await self.bring.complete_item(name=m.food or m.display, item_uuid=row.bring_uuid)
+                row.bring_hash = _bring_hash(completed=True, spec=m.spec())
                 log.info("mealie.checked->bring.complete", item=m.display)
-            elif row.bring_uuid:
-                # quantity/unit/note changed → update spec only (never rename).
-                await self.bring.update_spec(
-                    name=m.food or m.display, spec=m.spec(), item_uuid=row.bring_uuid
-                )
+            else:
+                spec = m.spec()
+                await self.bring.update_spec(name=m.food or m.display, spec=spec, item_uuid=row.bring_uuid)
+                row.bring_hash = _bring_hash(completed=False, spec=spec)
                 log.info("mealie.changed->bring.spec", item=m.display)
             row.mealie_hash = new_hash
 
@@ -152,21 +184,35 @@ class Reconciler:
             log.info("mealie.removed->bring.remove", mealie_id=row.mealie_id)
 
     # ── Bring → Mealie ──────────────────────────────────────────────
-    async def _create_in_mealie(self, b: BringItem, note: str) -> str:
-        """Create a Bring-originated item in Mealie.
+    async def _create_in_mealie(self, b: BringItem, units: dict[str, str]) -> MealieItem:
+        """Create a Mealie item mirroring a Bring item.
 
-        ``BRING_TO_MEALIE=food`` resolves the Bring item name to a Mealie food so
-        Mealie can aggregate it; on no match it falls back to a plain note item
-        (DESIGN.md §5, §11). ``note`` mode always creates a note item.
+        The Bring ``spec`` is split into a structured ``quantity`` (so "10 Eier"
+        becomes quantity 10, not the note "10 Eier" shown as "1 10 Eier"). With
+        ``BRING_TO_MEALIE=food`` the name is resolved to a Mealie food and the
+        leading unit token to a Mealie unit; otherwise a note item is created.
         """
+        quantity, remainder = parse_quantity(b.spec)
+
         if settings.bring_to_mealie == "food":
             food_id = await self.mealie.resolve_food_id(b.name)
             if food_id:
+                unit_id, note = _split_unit(remainder, units)
                 log.info("bring.added->mealie.food", item=b.name)
-                return await self.mealie.add_food_item(food_id=food_id, note=b.spec)
-        return await self.mealie.add_item(note=note)
+                return await self.mealie.create_item(
+                    note=note, quantity=quantity, food_id=food_id, unit_id=unit_id
+                )
 
-    async def _reconcile_bring_to_mealie(self, db: Session, bring_items: list[BringItem]) -> None:
+        note = f"{remainder} {b.name}".strip() if remainder else b.name
+        return await self.mealie.create_item(note=note, quantity=quantity)
+
+    async def _reconcile_bring_to_mealie(
+        self, db: Session, bring_items: list[BringItem], mealie_items: list[MealieItem], units: dict[str, str]
+    ) -> None:
+        mealie_by_norm: dict[str, MealieItem] = {}
+        for m in mealie_items:
+            mealie_by_norm.setdefault(m.norm_key, m)
+
         seen: set[str] = set()
 
         for b in bring_items:
@@ -175,25 +221,46 @@ class Reconciler:
             row = self._by_bring(db, b.uuid) or self._by_norm(db, b.norm_key)
 
             if row is None:
+                twin = mealie_by_norm.get(b.norm_key)
+                if twin is not None and self._by_mealie(db, twin.id) is None:
+                    db.add(ItemMap(
+                        mealie_id=twin.id, bring_uuid=b.uuid, norm_key=b.norm_key,
+                        mealie_hash=_mealie_hash(twin), bring_hash=new_hash,
+                    ))
+                    log.info("link.bring+mealie", item=b.name)
+                    continue
                 if b.completed:
-                    # Ignore items that arrive already-completed with no history.
+                    # Arrived already-completed with no history → just record it.
                     db.add(ItemMap(bring_uuid=b.uuid, norm_key=b.norm_key, bring_hash=new_hash))
                     continue
-                # Bring added (no mapping) → create in Mealie.
-                # DESIGN default: plain note item. BRING_TO_MEALIE=food resolves to a food.
-                note = f"{b.spec} {b.name}".strip() if b.spec else b.name
-                mealie_id = await self._create_in_mealie(b, note)
-                db.add(
-                    ItemMap(mealie_id=mealie_id, bring_uuid=b.uuid, norm_key=b.norm_key, bring_hash=new_hash)
-                )
+                created = await self._create_in_mealie(b, units)
+                db.add(ItemMap(
+                    mealie_id=created.id, bring_uuid=b.uuid, norm_key=b.norm_key,
+                    mealie_hash=_mealie_hash(created), bring_hash=new_hash,
+                ))
                 log.info("bring.added->mealie", item=b.name)
                 continue
 
             row.bring_uuid = b.uuid
+
+            # Heal a mapping that lost/never had its Mealie side.
+            if row.mealie_id is None and not b.completed:
+                twin = mealie_by_norm.get(b.norm_key)
+                if twin is not None and self._by_mealie(db, twin.id) is None:
+                    row.mealie_id = twin.id
+                    row.mealie_hash = _mealie_hash(twin)
+                    log.info("heal.link_mealie", item=b.name)
+                else:
+                    created = await self._create_in_mealie(b, units)
+                    row.mealie_id = created.id
+                    row.mealie_hash = _mealie_hash(created)
+                    log.info("heal.create_mealie", item=b.name)
+                row.bring_hash = new_hash
+                continue
+
             if row.bring_hash == new_hash:
                 continue
 
-            # Bring completed → check or delete the Mealie item.
             if b.completed and row.mealie_id:
                 if settings.on_complete == "delete":
                     await self.mealie.delete_item(row.mealie_id)
@@ -215,6 +282,7 @@ class Reconciler:
                     await self.mealie.set_checked(row.mealie_id, True)
             row.deleted_at = utcnow()
             log.info("bring.removed->mealie", bring_uuid=row.bring_uuid)
+
 
 
 async def poll_loop(stop: asyncio.Event) -> None:

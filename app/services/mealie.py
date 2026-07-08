@@ -33,14 +33,20 @@ class MealieItem:
         return normalize_name(self.food or self.note or self.display)
 
     def spec(self) -> str:
-        """Free-text spec pushed to Bring: '{qty} {unit} {note}'."""
+        """Free-text spec pushed to Bring.
+
+        For a **note** item (``food`` is ``None``) the note *is* the item name,
+        so the spec carries only quantity/unit — otherwise the name would be
+        duplicated on every round-trip ("Eier" -> "10 Eier" -> ...). For a
+        **food** item the note is a real annotation and is included.
+        """
         parts: list[str] = []
         if self.quantity:
             qty = int(self.quantity) if float(self.quantity).is_integer() else self.quantity
             parts.append(str(qty))
         if self.unit:
             parts.append(self.unit)
-        if self.note:
+        if self.food and self.note:
             parts.append(self.note)
         return " ".join(parts).strip()
 
@@ -102,28 +108,57 @@ class MealieClient:
         raw_items = data.get("listItems") or data.get("items") or []
         return [_to_item(i) for i in raw_items if i.get("id")]
 
-    async def add_item(self, *, note: str, quantity: float | None = None) -> str:
-        """Create a plain note item on the list. Returns the new Mealie item id.
+    async def fetch_units(self) -> dict[str, str]:
+        """Map normalized unit token -> ``unitId`` from Mealie's own unit list.
 
-        The create endpoint returns a ``ShoppingListItemsCollectionOut``
-        (``createdItems``/``updatedItems``/``deletedItems``), not a single item.
+        Lets the reconciler resolve a Bring spec's unit (e.g. ``cup``, ``g``)
+        to a real Mealie unit instead of guessing with a hardcoded list.
+        """
+        url = f"{_base()}/api/units"
+        resp = await self._client.get(url, headers=_headers(), params={"perPage": 200}, timeout=15)
+        resp.raise_for_status()
+        mapping: dict[str, str] = {}
+        for u in resp.json().get("items") or []:
+            uid = u.get("id")
+            if not uid:
+                continue
+            for label in (u.get("name"), u.get("pluralName"), u.get("abbreviation"), u.get("pluralAbbreviation")):
+                key = normalize_name(label)
+                if key:
+                    mapping.setdefault(key, uid)
+        return mapping
+
+    async def create_item(
+        self,
+        *,
+        note: str = "",
+        quantity: float | None = None,
+        food_id: str | None = None,
+        unit_id: str | None = None,
+    ) -> MealieItem:
+        """Create a shopping-list item and return it as a :class:`MealieItem`.
+
+        Returns the *server-resolved* item (built from the create response) so
+        the caller can store an exact ``mealie_hash`` and avoid a spurious
+        change being detected on the next cycle (round-trip prevention).
         """
         url = f"{_base()}/api/households/shopping/items"
         payload: dict = {
             "shoppingListId": settings.mealie_shopping_list_id,
             "note": note,
-            "isFood": False,
+            "quantity": quantity if quantity is not None else 1,
             "checked": False,
         }
-        if quantity is not None:
-            payload["quantity"] = quantity
+        if food_id:
+            payload["foodId"] = food_id
+        if unit_id:
+            payload["unitId"] = unit_id
         resp = await self._client.post(url, headers=_headers(), json=payload, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         created = data.get("createdItems") or []
-        if created:
-            return created[0]["id"]
-        return data.get("id", "")  # fallback for older Mealie versions
+        raw = created[0] if created else data  # fallback for older Mealie versions
+        return _to_item(raw)
 
     async def resolve_food_id(self, name: str) -> str | None:
         """Look up a Mealie food by name; return its id or ``None`` if no exact match.
@@ -144,25 +179,6 @@ class MealieClient:
             if normalize_name(food.get("name")) == target:
                 return food.get("id")
         return None
-
-    async def add_food_item(self, *, food_id: str, note: str = "", quantity: float | None = None) -> str:
-        """Create a food-backed item so Mealie can aggregate it. Returns the new id."""
-        url = f"{_base()}/api/households/shopping/items"
-        payload: dict = {
-            "shoppingListId": settings.mealie_shopping_list_id,
-            "foodId": food_id,
-            "isFood": True,
-            "checked": False,
-            "note": note,
-            "quantity": quantity if quantity is not None else 1,
-        }
-        resp = await self._client.post(url, headers=_headers(), json=payload, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        created = data.get("createdItems") or []
-        if created:
-            return created[0]["id"]
-        return data.get("id", "")  # fallback for older Mealie versions
 
     async def set_checked(self, item_id: str, checked: bool) -> None:
         """Toggle an item's checked state.
