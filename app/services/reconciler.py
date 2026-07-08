@@ -15,10 +15,14 @@ mapping is created or linked, so an item never immediately round-trips back to
 the side it came from.
 """
 import asyncio
+import time
+import uuid
+from collections import Counter
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from structlog.contextvars import bind_contextvars, clear_contextvars
 
 from app.config import settings
 from app.database import SessionLocal
@@ -61,6 +65,18 @@ class Reconciler:
     def __init__(self, mealie: MealieClient, bring: BringClient):
         self.mealie = mealie
         self.bring = bring
+        self._stats: Counter = Counter()
+
+    def _emit(self, bucket: str, event: str, *, warn: bool = False, **fields) -> None:
+        """Count an action for the per-cycle summary and log it.
+
+        Destructive actions (``warn=True``) are logged at WARNING so they stand
+        out and survive a ``LOG_LEVEL=WARNING`` filter — item removals are the
+        only irreversible operations, and this is the sole visibility a headless
+        service has into them.
+        """
+        self._stats[bucket] += 1
+        (log.warning if warn else log.info)(event, **fields)
 
     # ── mapping helpers ─────────────────────────────────────────────
     @staticmethod
@@ -81,18 +97,40 @@ class Reconciler:
 
     # ── single cycle ────────────────────────────────────────────────
     async def run_cycle(self) -> None:
-        mealie_items = await self.mealie.fetch_items()
-        bring_items = await self.bring.fetch_items()
-        # Mealie unit vocabulary — only needed to resolve Bring specs to foods.
-        units = await self.mealie.fetch_units() if settings.bring_to_mealie == "food" else {}
-
-        db = SessionLocal()
+        # Tag every log line in this cycle so the two interleaved directions can
+        # be grouped by a single grep (structlog merge_contextvars picks it up).
+        bind_contextvars(cycle_id=uuid.uuid4().hex[:8])
+        self._stats = Counter()
+        started = time.perf_counter()
         try:
-            await self._reconcile_mealie_to_bring(db, mealie_items, bring_items)
-            await self._reconcile_bring_to_mealie(db, bring_items, mealie_items, units)
-            db.commit()
+            mealie_items = await self.mealie.fetch_items()
+            bring_items = await self.bring.fetch_items()
+            # Mealie unit vocabulary — only needed to resolve Bring specs to foods.
+            units = await self.mealie.fetch_units() if settings.bring_to_mealie == "food" else {}
+
+            db = SessionLocal()
+            try:
+                await self._reconcile_mealie_to_bring(db, mealie_items, bring_items)
+                await self._reconcile_bring_to_mealie(db, bring_items, mealie_items, units)
+                db.commit()
+            finally:
+                db.close()
+
+            # Heartbeat: one line every cycle, even when idle, so the log itself
+            # proves liveness and shows the net effect at a glance.
+            log.info(
+                "cycle.done",
+                mealie_items=len(mealie_items),
+                bring_items=len(bring_items),
+                created=self._stats["created"],
+                updated=self._stats["updated"],
+                removed=self._stats["removed"],
+                linked=self._stats["linked"],
+                healed=self._stats["healed"],
+                duration_ms=round((time.perf_counter() - started) * 1000),
+            )
         finally:
-            db.close()
+            clear_contextvars()
 
     # ── Mealie → Bring ──────────────────────────────────────────────
     async def _create_in_bring(self, m: MealieItem) -> tuple[str, str]:
@@ -133,14 +171,14 @@ class Reconciler:
                         mealie_id=m.id, bring_uuid=twin.uuid, norm_key=m.norm_key,
                         mealie_hash=new_hash, bring_hash=twin.content_hash(),
                     ))
-                    log.info("link.mealie+bring", item=m.display)
+                    self._emit("linked", "link.mealie+bring", item=m.display)
                     continue
                 uuid, bhash = await self._create_in_bring(m)
                 db.add(ItemMap(
                     mealie_id=m.id, bring_uuid=uuid, norm_key=m.norm_key,
                     mealie_hash=new_hash, bring_hash=bhash,
                 ))
-                log.info("mealie.added->bring", item=m.display)
+                self._emit("created", "mealie.added->bring", item=m.display)
                 continue
 
             row.mealie_id = m.id
@@ -153,10 +191,10 @@ class Reconciler:
                 if twin is not None and self._by_bring(db, twin.uuid) is None:
                     row.bring_uuid = twin.uuid
                     row.bring_hash = twin.content_hash()
-                    log.info("heal.link_bring", item=m.display)
+                    self._emit("healed", "heal.link_bring", item=m.display)
                 else:
                     row.bring_uuid, row.bring_hash = await self._create_in_bring(m)
-                    log.info("heal.create_bring", item=m.display)
+                    self._emit("healed", "heal.create_bring", item=m.display)
                 row.mealie_hash = new_hash
                 continue
 
@@ -166,12 +204,12 @@ class Reconciler:
             if m.checked:
                 await self.bring.complete_item(name=m.food or m.display, item_uuid=row.bring_uuid)
                 row.bring_hash = _bring_hash(completed=True, spec=m.spec())
-                log.info("mealie.checked->bring.complete", item=m.display)
+                self._emit("updated", "mealie.checked->bring.complete", item=m.display)
             else:
                 spec = m.spec()
                 await self.bring.update_spec(name=m.food or m.display, spec=spec, item_uuid=row.bring_uuid)
                 row.bring_hash = _bring_hash(completed=False, spec=spec)
-                log.info("mealie.changed->bring.spec", item=m.display)
+                self._emit("updated", "mealie.changed->bring.spec", item=m.display)
             row.mealie_hash = new_hash
 
         # Mealie removed (had mapping, now absent) → propagate + tombstone.
@@ -181,7 +219,7 @@ class Reconciler:
             if row.bring_uuid:
                 await self.bring.remove_item(name=row.norm_key, item_uuid=row.bring_uuid)
             row.deleted_at = now
-            log.info("mealie.removed->bring.remove", mealie_id=row.mealie_id)
+            self._emit("removed", "mealie.removed->bring.remove", warn=True, mealie_id=row.mealie_id)
 
     # ── Bring → Mealie ──────────────────────────────────────────────
     async def _create_in_mealie(self, b: BringItem, units: dict[str, str]) -> MealieItem:
@@ -198,7 +236,7 @@ class Reconciler:
             food_id = await self.mealie.resolve_food_id(b.name)
             if food_id:
                 unit_id, note = _split_unit(remainder, units)
-                log.info("bring.added->mealie.food", item=b.name)
+                log.debug("bring.resolved_food", item=b.name, food_id=food_id)
                 return await self.mealie.create_item(
                     note=note, quantity=quantity, food_id=food_id, unit_id=unit_id
                 )
@@ -227,7 +265,7 @@ class Reconciler:
                         mealie_id=twin.id, bring_uuid=b.uuid, norm_key=b.norm_key,
                         mealie_hash=_mealie_hash(twin), bring_hash=new_hash,
                     ))
-                    log.info("link.bring+mealie", item=b.name)
+                    self._emit("linked", "link.bring+mealie", item=b.name)
                     continue
                 if b.completed:
                     # Arrived already-completed with no history → just record it.
@@ -238,7 +276,7 @@ class Reconciler:
                     mealie_id=created.id, bring_uuid=b.uuid, norm_key=b.norm_key,
                     mealie_hash=_mealie_hash(created), bring_hash=new_hash,
                 ))
-                log.info("bring.added->mealie", item=b.name)
+                self._emit("created", "bring.added->mealie", item=b.name)
                 continue
 
             row.bring_uuid = b.uuid
@@ -249,12 +287,12 @@ class Reconciler:
                 if twin is not None and self._by_mealie(db, twin.id) is None:
                     row.mealie_id = twin.id
                     row.mealie_hash = _mealie_hash(twin)
-                    log.info("heal.link_mealie", item=b.name)
+                    self._emit("healed", "heal.link_mealie", item=b.name)
                 else:
                     created = await self._create_in_mealie(b, units)
                     row.mealie_id = created.id
                     row.mealie_hash = _mealie_hash(created)
-                    log.info("heal.create_mealie", item=b.name)
+                    self._emit("healed", "heal.create_mealie", item=b.name)
                 row.bring_hash = new_hash
                 continue
 
@@ -265,10 +303,10 @@ class Reconciler:
                 if settings.on_complete == "delete":
                     await self.mealie.delete_item(row.mealie_id)
                     row.deleted_at = utcnow()
-                    log.info("bring.completed->mealie.delete", item=b.name)
+                    self._emit("updated", "bring.completed->mealie.delete", warn=True, item=b.name)
                 else:
                     await self.mealie.set_checked(row.mealie_id, True)
-                    log.info("bring.completed->mealie.check", item=b.name)
+                    self._emit("updated", "bring.completed->mealie.check", item=b.name)
             row.bring_hash = new_hash
 
         # Bring removed entirely (had mapping) → propagate + tombstone.
@@ -281,7 +319,7 @@ class Reconciler:
                 else:
                     await self.mealie.set_checked(row.mealie_id, True)
             row.deleted_at = utcnow()
-            log.info("bring.removed->mealie", bring_uuid=row.bring_uuid)
+            self._emit("removed", "bring.removed->mealie", warn=True, bring_uuid=row.bring_uuid)
 
 
 
