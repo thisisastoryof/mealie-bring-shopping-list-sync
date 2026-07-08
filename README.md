@@ -17,10 +17,10 @@ underlying APIs instead of routing through Home Assistant `todo` entities.
 - **Bring!** — [`miaucl/bring-api`](https://github.com/miaucl/bring-api), the same
   unofficial client the Home Assistant Bring integration uses.
 - **Engine** — one async poll loop diffs each list against a SQLite state store
-  and applies only **transitions** (add / change / check / remove), tracked by
-  `mealie_id ⇄ bring_uuid` with tombstones so deletes don't resurrect. Items
-  already on both lists are **merged by name** on first sight (never duplicated);
-  one-sided items are mirrored across.
+  and applies only **transitions** (add / change / check / uncheck / remove),
+  tracked by `mealie_id ⇄ bring_uuid` with tombstones so deletes don't
+  resurrect. Items already on both lists are **merged by name** on first sight
+  (never duplicated); one-sided items are mirrored across.
 - **Quantities & units** — a Bring `spec` like `500 g` is parsed into Mealie's
   structured `quantity`/`unit`; on the way back, units use Mealie's own
   singular/plural forms (`2 cups`, not `2 cup`).
@@ -77,15 +77,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `FRESHNESS_DEBOUNCE_SECONDS` | `5`             | Skip items edited within this window (mid-edit).            |
 | `QUIET_HOURS`                | _(off)_         | Suspend polling in a local-time window, e.g. `23:00-07:00`. |
 | `DB_PATH`                    | `/data/sync.db` | SQLite state store path.                                    |
-| `LOG_LEVEL`                  | `INFO`          | Log verbosity. `DEBUG` also traces every HTTP request.      |
+| `LOG_LEVEL`                  | `INFO`          | Log verbosity. `DEBUG` also traces every HTTP request (outbound Mealie/Bring calls + inbound `/health`). |
 
-## Status
-
-**Working.** Core bidirectional sync — add / change / check / remove, quantity
-and unit mirroring, and merge-on-first-run — has been validated against live
-Mealie and Bring instances. When deploying against a different setup, sanity-check
-`bring-api` method signatures against the pinned version and the Mealie
-shopping-list endpoints against your Mealie version.
+> **Compatibility:** validated against live Mealie and Bring instances. On a
+> different setup, sanity-check `bring-api` method signatures against the pinned
+> version and Mealie's shopping-list endpoints against your Mealie version —
+> both vary between releases.
 
 ## License
 
