@@ -20,12 +20,17 @@ from app.config import settings
 from app.database import SessionLocal
 from app.health import health
 from app.logging_config import get_logger
-from app.models import ItemMap
+from app.models import ItemMap, Meta
 from app.services.bring import BringClient, BringItem
 from app.services.mealie import MealieClient, MealieItem
 from app.utils import is_quiet_now, stable_hash, utcnow
 
 log = get_logger(__name__)
+
+# Meta key marking that first-run seeding has completed. Persisted so seeding
+# runs exactly once for the lifetime of the state store, not on every process
+# start (otherwise a restart re-inserts existing mappings -> UNIQUE violation).
+SEEDED_KEY = "seeded_at"
 
 
 def _mealie_hash(item: MealieItem) -> str:
@@ -57,14 +62,15 @@ class Reconciler:
         )
 
     # ── single cycle ────────────────────────────────────────────────
-    async def run_cycle(self, *, seed: bool = False) -> None:
+    async def run_cycle(self) -> None:
         mealie_items = await self.mealie.fetch_items()
         bring_items = await self.bring.fetch_items()
 
         db = SessionLocal()
         try:
-            if seed:
+            if db.get(Meta, SEEDED_KEY) is None:
                 self._seed(db, mealie_items, bring_items)
+                db.add(Meta(key=SEEDED_KEY, value=utcnow().isoformat()))
             else:
                 await self._reconcile_mealie_to_bring(db, mealie_items)
                 await self._reconcile_bring_to_mealie(db, bring_items)
@@ -75,12 +81,18 @@ class Reconciler:
     # ── first run: mark everything known, create no side effects ────
     def _seed(self, db: Session, mealie_items: list[MealieItem], bring_items: list[BringItem]) -> None:
         log.info("seed.start", mealie=len(mealie_items), bring=len(bring_items))
+        existing_mealie = set(db.scalars(select(ItemMap.mealie_id).where(ItemMap.mealie_id.is_not(None))))
+        existing_bring = set(db.scalars(select(ItemMap.bring_uuid).where(ItemMap.bring_uuid.is_not(None))))
         by_norm: dict[str, ItemMap] = {}
         for m in mealie_items:
+            if m.id in existing_mealie:
+                continue
             row = ItemMap(mealie_id=m.id, norm_key=m.norm_key, mealie_hash=_mealie_hash(m))
             db.add(row)
             by_norm[m.norm_key] = row
         for b in bring_items:
+            if b.uuid in existing_bring:
+                continue
             row = by_norm.get(b.norm_key)
             if row is not None and row.bring_uuid is None:
                 row.bring_uuid = b.uuid
@@ -213,16 +225,14 @@ async def poll_loop(stop: asyncio.Event) -> None:
         await bring.connect()
         reconciler = Reconciler(mealie, bring)
 
-        first = True
         try:
             while not stop.is_set():
                 if is_quiet_now(settings.quiet_hours, settings.timezone):
                     log.debug("cycle.skipped_quiet_hours", window=settings.quiet_hours)
                 else:
                     try:
-                        await reconciler.run_cycle(seed=first)
+                        await reconciler.run_cycle()
                         health.record_success()
-                        first = False
                     except Exception as exc:  # keep the loop alive; surface via /health + logs
                         health.record_failure(str(exc))
                         log.error("cycle.failed", error=str(exc), exc_info=True)
