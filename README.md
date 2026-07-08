@@ -18,7 +18,12 @@ underlying APIs instead of routing through Home Assistant `todo` entities.
   unofficial client the Home Assistant Bring integration uses.
 - **Engine** — one async poll loop diffs each list against a SQLite state store
   and applies only **transitions** (add / change / check / remove), tracked by
-  `mealie_id ⇄ bring_uuid` with tombstones so deletes don't resurrect.
+  `mealie_id ⇄ bring_uuid` with tombstones so deletes don't resurrect. Items
+  already on both lists are **merged by name** on first sight (never duplicated);
+  one-sided items are mirrored across.
+- **Quantities & units** — a Bring `spec` like `500 g` is parsed into Mealie's
+  structured `quantity`/`unit`; on the way back, units use Mealie's own
+  singular/plural forms (`2 cups`, not `2 cup`).
 
 ```
 Mealie shopping list  ⇄  [ sync service + SQLite state ]  ⇄  Bring! list
@@ -26,7 +31,10 @@ Mealie shopping list  ⇄  [ sync service + SQLite state ]  ⇄  Bring! list
 ```
 
 Runs **headless**: no UI, structured logs, and a `/health` endpoint for the
-Docker healthcheck.
+Docker healthcheck. Every cycle emits a `cycle.done` heartbeat (item counts +
+duration) so the log proves liveness even when idle; irreversible actions
+(removals/deletes) log at `WARNING`, and each line carries a `cycle_id` so a
+single cycle can be grouped with one `grep`.
 
 ## Quick start
 
@@ -73,10 +81,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## Status
 
-**Skeleton.** The reconciliation structure, clients, state model, and poll loop
-are in place. Before production use, verify: `bring-api` method signatures against
-the pinned version, Mealie shopping-list endpoints against your Mealie version,
-and the first-run seeding on your real lists (dry run recommended).
+**Working.** Core bidirectional sync — add / change / check / remove, quantity
+and unit mirroring, and merge-on-first-run — has been validated against live
+Mealie and Bring instances. When deploying against a different setup, sanity-check
+`bring-api` method signatures against the pinned version and the Mealie
+shopping-list endpoints against your Mealie version.
 
 ## License
 
