@@ -64,19 +64,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## Configuration
 
-| Env var                      | Default         | Purpose                                                     |
-| ---------------------------- | --------------- | ----------------------------------------------------------- |
-| `MEALIE_BASE_URL`            | —               | e.g. `http://mealie:9000` (internal network).               |
-| `MEALIE_API_KEY`             | —               | Mealie Bearer token.                                        |
-| `MEALIE_SHOPPING_LIST_ID`    | —               | Target shopping list UUID.                                  |
-| `BRING_EMAIL` / `_PASSWORD`  | —               | Bring credentials.                                          |
-| `BRING_LIST_NAME`            | `Shopping`      | Target Bring list (resolved to a UUID on startup).          |
-| `POLL_INTERVAL`              | `60`            | Seconds between cycles.                                     |
-| `ON_COMPLETE`                | `check`         | On Bring completion: `check` (keep history) or `delete`.    |
-| `BRING_TO_MEALIE`            | `note`          | Bring-originated items → `note` or resolve to `food`.       |
-| `FRESHNESS_DEBOUNCE_SECONDS` | `5`             | Skip items edited within this window (mid-edit).            |
-| `QUIET_HOURS`                | _(off)_         | Suspend polling in a local-time window, e.g. `23:00-07:00`. |
-| `DB_PATH`                    | `/data/sync.db` | SQLite state store path.                                    |
+| Env var                      | Default         | Purpose                                                                                                  |
+| ---------------------------- | --------------- | -------------------------------------------------------------------------------------------------------- |
+| `MEALIE_BASE_URL`            | —               | e.g. `http://mealie:9000` (internal network).                                                            |
+| `MEALIE_API_KEY`             | —               | Mealie Bearer token.                                                                                     |
+| `MEALIE_SHOPPING_LIST_ID`    | —               | Target shopping list UUID.                                                                               |
+| `BRING_EMAIL` / `_PASSWORD`  | —               | Bring credentials.                                                                                       |
+| `BRING_LIST_NAME`            | `Shopping`      | Target Bring list (resolved to a UUID on startup).                                                       |
+| `POLL_INTERVAL`              | `60`            | Seconds between cycles.                                                                                  |
+| `ON_COMPLETE`                | `check`         | On Bring completion: `check` (keep history) or `delete`.                                                 |
+| `BRING_TO_MEALIE`            | `note`          | Bring-originated items → `note` or resolve to `food`.                                                    |
+| `FRESHNESS_DEBOUNCE_SECONDS` | `5`             | Skip items edited within this window (mid-edit).                                                         |
+| `QUIET_HOURS`                | _(off)_         | Suspend polling in a local-time window, e.g. `23:00-07:00`.                                              |
+| `DB_PATH`                    | `/data/sync.db` | SQLite state store path.                                                                                 |
 | `LOG_LEVEL`                  | `INFO`          | Log verbosity. `DEBUG` also traces every HTTP request (outbound Mealie/Bring calls + inbound `/health`). |
 
 > **Compatibility:** validated against live Mealie and Bring instances. On a

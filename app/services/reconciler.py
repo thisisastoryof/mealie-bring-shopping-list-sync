@@ -38,8 +38,17 @@ log = get_logger(__name__)
 
 
 def _mealie_hash(item: MealieItem) -> str:
+    # ``name`` (normalized) is part of the signature so a corrected/changed food
+    # name registers as a transition — otherwise a rename is invisible to the
+    # engine and never reaches Bring.
     return stable_hash(
-        {"checked": item.checked, "quantity": item.quantity, "unit": item.unit, "note": item.note}
+        {
+            "name": item.norm_key,
+            "checked": item.checked,
+            "quantity": item.quantity,
+            "unit": item.unit,
+            "note": item.note,
+        }
     )
 
 
@@ -197,6 +206,10 @@ class Reconciler:
                 continue
 
             row.mealie_id = m.id
+            # Keep the fallback matcher current after a rename (guarded so an
+            # unchanged name doesn't needlessly bump ``updated_at`` every cycle).
+            if row.norm_key != m.norm_key:
+                row.norm_key = m.norm_key
 
             # Heal a mapping that lost/never had its Bring side (e.g. a legacy
             # one-sided seed row) so the item finally mirrors across.
@@ -215,15 +228,41 @@ class Reconciler:
             if row.mealie_hash == new_hash:
                 continue  # no transition
 
+            twin = bring_by_uuid.get(row.bring_uuid)
+
             if m.checked:
                 await self.bring.complete_item(name=m.food or m.display, item_uuid=row.bring_uuid)
                 # Completing doesn't change Bring's spec, so record the hash from
                 # the item's *actual* spec (not m.spec(), which may render
                 # differently) — otherwise the Bring->Mealie pass re-fires it.
-                twin = bring_by_uuid.get(row.bring_uuid)
                 completed_spec = twin.spec if twin is not None else m.spec()
                 row.bring_hash = _bring_hash(completed=True, spec=completed_spec)
                 self._emit("updated", "mealie.checked->bring.complete", item=m.display)
+            elif twin is not None and twin.norm_key != m.norm_key:
+                # On Bring the item *name* is its identity (itemId) and can't be
+                # renamed in place, so a changed food name is mirrored as delete
+                # + recreate. Bring already models its own renames this way (new
+                # uuid), so this keeps both directions symmetric. Only for active
+                # items — recreating a completed twin would resurrect it into the
+                # purchase bucket.
+                name = m.food or m.note or m.display
+                spec = m.spec()
+                await self.bring.remove_item(name=twin.name, item_uuid=row.bring_uuid)
+                new_uuid, bhash = await self._create_in_bring(m)
+                # Keep the in-memory snapshot consistent so the Bring->Mealie
+                # pass links the fresh uuid instead of re-importing the stale one
+                # as a brand-new item.
+                bring_items.remove(twin)
+                bring_by_uuid.pop(row.bring_uuid, None)
+                snapshot = BringItem(uuid=new_uuid, name=name, spec=spec, completed=False)
+                bring_items.append(snapshot)
+                bring_by_uuid[new_uuid] = snapshot
+                row.bring_uuid = new_uuid
+                row.bring_hash = bhash
+                self._emit(
+                    "updated", "mealie.renamed->bring.recreate",
+                    item=m.display, old=twin.name, destructive=True,
+                )
             else:
                 spec = m.spec()
                 await self.bring.update_spec(name=m.food or m.display, spec=spec, item_uuid=row.bring_uuid)
