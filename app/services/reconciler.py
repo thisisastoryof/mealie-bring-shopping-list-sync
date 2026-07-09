@@ -238,14 +238,16 @@ class Reconciler:
                 completed_spec = twin.spec if twin is not None else m.spec()
                 row.bring_hash = _bring_hash(completed=True, spec=completed_spec)
                 self._emit("updated", "mealie.checked->bring.complete", item=m.display)
-            elif twin is not None and twin.norm_key != m.norm_key:
+            elif m.food and twin is not None and twin.norm_key != m.norm_key:
                 # On Bring the item *name* is its identity (itemId) and can't be
                 # renamed in place, so a changed food name is mirrored as delete
-                # + recreate. Bring already models its own renames this way (new
-                # uuid), so this keeps both directions symmetric. Only for active
-                # items — recreating a completed twin would resurrect it into the
-                # purchase bucket.
-                name = m.food or m.note or m.display
+                # + recreate. Restricted to **food** items: their Bring name is
+                # the food name (quantity-independent), so this only fires on a
+                # genuine rename. Note items derive their name from the display
+                # text, which embeds the quantity — comparing it would misread a
+                # quantity change as a rename and churn destructively. Only for
+                # active items — recreating a completed twin would resurrect it.
+                name = m.food
                 spec = m.spec()
                 await self.bring.remove_item(name=twin.name, item_uuid=row.bring_uuid)
                 new_uuid, bhash = await self._create_in_bring(m)

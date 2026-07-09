@@ -179,7 +179,11 @@ class MealieClient:
         resp = await self._client.post(url, headers=_headers(), json=payload, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        created = data.get("createdItems") or []
+        # Mealie dedupes on create: a posted item that matches an existing one is
+        # *merged* and comes back under ``updatedItems`` (with ``createdItems``
+        # empty). Map to that existing item instead of falling through to the
+        # envelope, which has no ``id`` (KeyError that would kill the cycle).
+        created = data.get("createdItems") or data.get("updatedItems") or []
         raw = created[0] if created else data  # fallback for older Mealie versions
         return _to_item(raw)
 
