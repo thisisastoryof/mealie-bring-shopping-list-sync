@@ -238,16 +238,14 @@ class Reconciler:
                 completed_spec = twin.spec if twin is not None else m.spec()
                 row.bring_hash = _bring_hash(completed=True, spec=completed_spec)
                 self._emit("updated", "mealie.checked->bring.complete", item=m.display)
-            elif m.food and twin is not None and twin.norm_key != m.norm_key:
+            elif twin is not None and twin.norm_key != m.norm_key:
                 # On Bring the item *name* is its identity (itemId) and can't be
-                # renamed in place, so a changed food name is mirrored as delete
-                # + recreate. Restricted to **food** items: their Bring name is
-                # the food name (quantity-independent), so this only fires on a
-                # genuine rename. Note items derive their name from the display
-                # text, which embeds the quantity — comparing it would misread a
-                # quantity change as a rename and churn destructively. Only for
+                # renamed in place, so a changed name — a food rename or a
+                # corrected note — is mirrored as delete + recreate. The name is
+                # quantity-free (food name or note text), so a mere quantity
+                # change keeps ``norm_key`` stable and never lands here. Only for
                 # active items — recreating a completed twin would resurrect it.
-                name = m.food
+                name = m.food or m.note or m.display
                 spec = m.spec()
                 await self.bring.remove_item(name=twin.name, item_uuid=row.bring_uuid)
                 new_uuid, bhash = await self._create_in_bring(m)
@@ -261,10 +259,17 @@ class Reconciler:
                 bring_by_uuid[new_uuid] = snapshot
                 row.bring_uuid = new_uuid
                 row.bring_hash = bhash
+                row.mealie_hash = new_hash
+                # Recreate is the one non-idempotent action (a real delete + add
+                # on Bring). Persist the new mapping right away so a crash later
+                # in the cycle can't roll it back and make the next cycle recreate
+                # the item again — the failure mode that multiplied items.
+                db.commit()
                 self._emit(
                     "updated", "mealie.renamed->bring.recreate",
                     item=m.display, old=twin.name, destructive=True,
                 )
+                continue
             else:
                 spec = m.spec()
                 await self.bring.update_spec(name=m.food or m.display, spec=spec, item_uuid=row.bring_uuid)
