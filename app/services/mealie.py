@@ -207,12 +207,16 @@ class MealieClient:
                 return food.get("id")
         return None
 
-    async def set_checked(self, item_id: str, checked: bool) -> None:
-        """Toggle an item's checked state.
+    async def set_checked(self, item_id: str, checked: bool) -> MealieItem:
+        """Toggle an item's checked state and return the *persisted* item.
 
         ``ShoppingListItemUpdate`` requires ``shoppingListId`` and resets unset
         fields to defaults, so read the current item and merge rather than
         sending a bare ``{checked}`` (which would clobber quantity/note).
+
+        The item is re-read after the write and returned so the reconciler can
+        hash **observed** state instead of an optimistic guess — the invariant
+        that stops a completed item resurrecting and the checked-state ping-pong.
         """
         url = f"{_base()}/api/households/shopping/items/{item_id}"
         current = (await self._client.get(url, headers=_headers(), timeout=15)).json()
@@ -230,6 +234,9 @@ class MealieClient:
         }
         resp = await self._client.put(url, headers=_headers(), json=payload, timeout=15)
         resp.raise_for_status()
+        fresh = await self._client.get(url, headers=_headers(), timeout=15)
+        fresh.raise_for_status()
+        return _to_item(fresh.json())
 
     async def delete_item(self, item_id: str) -> None:
         url = f"{_base()}/api/households/shopping/items/{item_id}"

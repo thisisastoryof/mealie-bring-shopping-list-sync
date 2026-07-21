@@ -1,24 +1,25 @@
 """Reconciliation engine + async poll loop (DESIGN.md §5).
 
-Each cycle:
-  1. Fetch the Mealie list and the Bring list (purchase + recently).
-  2. Link the two sides by stable id (``mealie_id`` <-> ``bring_uuid``), falling
-     back to normalized name to *merge* pre-existing items instead of duplicating.
-  3. Heal one-sided mappings (create the missing counterpart) and apply only
-     *transitions* against the stored per-side hash.
-  4. Persist new hashes / mappings / tombstones.
+Each cycle runs a single-pass **three-way merge**: every logical item is
+compared on *both* sides against its stored shadow (``mealie_hash`` /
+``bring_hash``), and only *transitions* are acted on.
 
-Diffing against **stored** state (not the live snapshot) is what makes a
-lingering completed/removed item act exactly once — the failure that made the
-old Home-Assistant approach unfixable. Both hashes are written whenever a
-mapping is created or linked, so an item never immediately round-trips back to
-the side it came from.
+  1. Fetch the Mealie list and the Bring list (purchase + recently).
+  2. Join the two sides by stable id (``mealie_id`` <-> ``bring_uuid``), falling
+     back to normalized name to *merge* pre-existing items instead of duplicating.
+  3. For each mapping decide from the (mealie_changed, bring_changed) matrix;
+     heal one-sided mappings; propagate removals with tombstones.
+
+CORE INVARIANT: the shadow is **only ever written from observed state** — API
+responses or read-backs — never from an optimistic guess about what the other
+side now looks like. That is what stops a Bring-completed item from resurrecting
+and the checked-state ping-pong. Tombstoned rows still claim their ids so a
+still-present live item cannot be re-imported as brand-new.
 """
 import asyncio
 import time
 import uuid
-from collections import Counter
-from dataclasses import replace
+from collections import Counter, defaultdict
 
 import httpx
 from sqlalchemy import select
@@ -91,23 +92,6 @@ class Reconciler:
             fields["destructive"] = True
         log.info(event, **fields)
 
-    # ── mapping helpers ─────────────────────────────────────────────
-    @staticmethod
-    def _by_mealie(db: Session, mealie_id: str) -> ItemMap | None:
-        return db.scalar(select(ItemMap).where(ItemMap.mealie_id == mealie_id))
-
-    @staticmethod
-    def _by_bring(db: Session, bring_uuid: str) -> ItemMap | None:
-        return db.scalar(select(ItemMap).where(ItemMap.bring_uuid == bring_uuid))
-
-    @staticmethod
-    def _by_norm(db: Session, norm_key: str) -> ItemMap | None:
-        if not norm_key:
-            return None
-        return db.scalar(
-            select(ItemMap).where(ItemMap.norm_key == norm_key, ItemMap.deleted_at.is_(None))
-        )
-
     # ── single cycle ────────────────────────────────────────────────
     async def run_cycle(self) -> None:
         # Tag every log line in this cycle so the two interleaved directions can
@@ -123,8 +107,7 @@ class Reconciler:
 
             db = SessionLocal()
             try:
-                await self._reconcile_mealie_to_bring(db, mealie_items, bring_items)
-                await self._reconcile_bring_to_mealie(db, bring_items, mealie_items, units)
+                await self._reconcile(db, mealie_items, bring_items, units)
                 db.commit()
             finally:
                 db.close()
@@ -152,140 +135,284 @@ class Reconciler:
         uuid = await self.bring.add_item(name=m.food or m.note or m.display, spec=spec)
         return uuid, _bring_hash(completed=False, spec=spec)
 
-    async def _reconcile_mealie_to_bring(
-        self, db: Session, mealie_items: list[MealieItem], bring_items: list[BringItem]
+    @staticmethod
+    def _too_fresh(m: MealieItem, now) -> bool:
+        """True if ``m`` was edited within the debounce window (skip mid-edit)."""
+        if m.updated_at is None:
+            return False
+        age = (now - m.updated_at).total_seconds()
+        return 0 <= age < settings.freshness_debounce_seconds
+
+    async def _reconcile(
+        self,
+        db: Session,
+        mealie_items: list[MealieItem],
+        bring_items: list[BringItem],
+        units: dict[str, str],
     ) -> None:
-        # Live Bring items by name, used to *merge* an existing Bring twin
-        # instead of creating a duplicate (first-run / pre-existing items).
-        bring_by_norm: dict[str, BringItem] = {}
-        bring_by_uuid: dict[str, BringItem] = {}
-        for b in bring_items:
-            bring_by_norm.setdefault(b.norm_key, b)
-            bring_by_uuid[b.uuid] = b
+        """Single-pass three-way merge over every logical item.
 
-        seen: set[str] = set()
+        Each item is diffed on both sides against its stored shadow; only
+        transitions are acted on, and the shadow is always rewritten from
+        observed state (see the module docstring's core invariant).
+        """
         now = utcnow()
+        mealie_by_id = {m.id: m for m in mealie_items}
+        bring_by_uuid = {b.uuid: b for b in bring_items}
 
+        # Claim every id owned by a mapping — tombstoned ones included, so a
+        # still-present live item can't be resurrected as brand-new.
+        all_rows = db.scalars(select(ItemMap)).all()
+        active_rows = [r for r in all_rows if r.deleted_at is None]
+        claimed_m: set[str] = {r.mealie_id for r in all_rows if r.mealie_id}
+        claimed_b: set[str] = {r.bring_uuid for r in all_rows if r.bring_uuid}
+
+        # Unclaimed live items (no stored mapping) are the only candidates for
+        # pairing the two sides by normalized name.
+        unclaimed_mealie: dict[str, list[MealieItem]] = defaultdict(list)
         for m in mealie_items:
-            seen.add(m.id)
+            if m.id not in claimed_m:
+                unclaimed_mealie[m.norm_key].append(m)
+        unclaimed_bring: dict[str, list[BringItem]] = defaultdict(list)
+        for b in bring_items:
+            if b.uuid not in claimed_b:
+                unclaimed_bring[b.norm_key].append(b)
 
-            # Freshness debounce — skip items edited mid-write.
-            if m.updated_at is not None:
-                age = (now - m.updated_at).total_seconds()
-                if 0 <= age < settings.freshness_debounce_seconds:
+        def pop_bring(norm: str) -> BringItem | None:
+            lst = unclaimed_bring.get(norm)
+            if not lst:
+                return None
+            chosen: BringItem | None = None
+            for x in lst:  # prefer an active twin over a completed one
+                if x.uuid in claimed_b:
                     continue
+                if chosen is None or (not x.completed and chosen.completed):
+                    chosen = x
+            if chosen is None:
+                return None
+            lst.remove(chosen)
+            claimed_b.add(chosen.uuid)
+            return chosen
 
-            new_hash = _mealie_hash(m)
-            row = self._by_mealie(db, m.id) or self._by_norm(db, m.norm_key)
-
-            if row is None:
-                twin = bring_by_norm.get(m.norm_key)
-                if twin is not None and self._by_bring(db, twin.uuid) is None:
-                    # Same item already on both sides → link, no side effect.
-                    db.add(ItemMap(
-                        mealie_id=m.id, bring_uuid=twin.uuid, norm_key=m.norm_key,
-                        mealie_hash=new_hash, bring_hash=twin.content_hash(),
-                    ))
-                    self._emit("linked", "link.mealie+bring", item=m.display)
+        def pop_mealie(norm: str) -> MealieItem | None:
+            lst = unclaimed_mealie.get(norm)
+            if not lst:
+                return None
+            chosen: MealieItem | None = None
+            for x in lst:  # prefer an active (unchecked) twin
+                if x.id in claimed_m:
                     continue
-                uuid, bhash = await self._create_in_bring(m)
-                db.add(ItemMap(
-                    mealie_id=m.id, bring_uuid=uuid, norm_key=m.norm_key,
-                    mealie_hash=new_hash, bring_hash=bhash,
-                ))
-                self._emit("created", "mealie.added->bring", item=m.display)
+                if chosen is None or (not x.checked and chosen.checked):
+                    chosen = x
+            if chosen is None:
+                return None
+            lst.remove(chosen)
+            claimed_m.add(chosen.id)
+            return chosen
+
+        # ── Stage 1: existing mappings (removal · heal · merge) ──────
+        for row in active_rows:
+            m = mealie_by_id.get(row.mealie_id) if row.mealie_id else None
+            b = bring_by_uuid.get(row.bring_uuid) if row.bring_uuid else None
+            mealie_gone = row.mealie_id is not None and m is None
+            bring_gone = row.bring_uuid is not None and b is None
+
+            # A mapped side vanished → propagate the removal once, then tombstone.
+            if mealie_gone or bring_gone:
+                if mealie_gone and b is not None:
+                    await self.bring.remove_item(name=row.norm_key, item_uuid=row.bring_uuid)
+                    self._emit("removed", "mealie.removed->bring.remove", item=row.norm_key, destructive=True)
+                elif bring_gone and m is not None:
+                    deleted = settings.on_complete == "delete"
+                    if deleted:
+                        await self.mealie.delete_item(row.mealie_id)
+                    else:
+                        await self.mealie.set_checked(row.mealie_id, True)
+                    self._emit("removed", "bring.removed->mealie", item=row.norm_key, destructive=deleted)
+                row.deleted_at = now
                 continue
 
-            if row.deleted_at is not None:
-                # The mapping was already torn down (e.g. the Bring side was
-                # removed and, with ON_COMPLETE=check, the Mealie item was only
-                # checked — so it still shows up here). Leave the closed mapping
-                # closed. Reviving it (deleted_at=None) makes the Bring→Mealie
-                # pass re-detect the still-absent Bring item and re-log the exact
-                # same removal on every cycle.
-                continue
-
-            row.mealie_id = m.id
-            # Keep the fallback matcher current after a rename (guarded so an
-            # unchanged name doesn't needlessly bump ``updated_at`` every cycle).
-            if row.norm_key != m.norm_key:
-                row.norm_key = m.norm_key
-
-            # Heal a mapping that lost/never had its Bring side (e.g. a legacy
-            # one-sided seed row) so the item finally mirrors across.
+            # Heal a one-sided mapping by linking a live twin or creating one.
             if row.bring_uuid is None:
-                twin = bring_by_norm.get(m.norm_key)
-                if twin is not None and self._by_bring(db, twin.uuid) is None:
+                if m is None:
+                    continue
+                twin = pop_bring(m.norm_key)
+                if twin is not None:
                     row.bring_uuid = twin.uuid
                     row.bring_hash = twin.content_hash()
                     self._emit("healed", "heal.link_bring", item=m.display)
                 else:
-                    row.bring_uuid, row.bring_hash = await self._create_in_bring(m)
+                    new_uuid, bhash = await self._create_in_bring(m)
+                    row.bring_uuid = new_uuid
+                    row.bring_hash = bhash
                     self._emit("healed", "heal.create_bring", item=m.display)
-                row.mealie_hash = new_hash
+                row.mealie_hash = _mealie_hash(m)
+                continue
+            if row.mealie_id is None:
+                if b is None:
+                    continue
+                if b.completed:
+                    row.bring_hash = b.content_hash()
+                    continue
+                twin = pop_mealie(b.norm_key)
+                if twin is not None:
+                    row.mealie_id = twin.id
+                    if twin.checked:
+                        updated = await self.mealie.set_checked(twin.id, False)
+                        row.mealie_hash = _mealie_hash(updated)
+                        self._emit("updated", "bring.active->mealie.uncheck", item=b.name)
+                    else:
+                        row.mealie_hash = _mealie_hash(twin)
+                    self._emit("healed", "heal.link_mealie", item=b.name)
+                else:
+                    created = await self._create_in_mealie(b, units)
+                    row.mealie_id = created.id
+                    row.mealie_hash = _mealie_hash(created)
+                    self._emit("healed", "heal.create_mealie", item=b.name)
+                row.bring_hash = b.content_hash()
                 continue
 
-            if row.mealie_hash == new_hash:
-                continue  # no transition
-
-            twin = bring_by_uuid.get(row.bring_uuid)
-
-            if m.checked:
-                await self.bring.complete_item(name=m.food or m.display, item_uuid=row.bring_uuid)
-                # Completing doesn't change Bring's spec, so record the hash from
-                # the item's *actual* spec (not m.spec(), which may render
-                # differently) — otherwise the Bring->Mealie pass re-fires it.
-                completed_spec = twin.spec if twin is not None else m.spec()
-                row.bring_hash = _bring_hash(completed=True, spec=completed_spec)
-                self._emit("updated", "mealie.checked->bring.complete", item=m.display)
-            elif twin is not None and twin.norm_key != m.norm_key:
-                # On Bring the item *name* is its identity (itemId) and can't be
-                # renamed in place, so a changed name — a food rename or a
-                # corrected note — is mirrored as delete + recreate. The name is
-                # quantity-free (food name or note text), so a mere quantity
-                # change keeps ``norm_key`` stable and never lands here. Only for
-                # active items — recreating a completed twin would resurrect it.
-                name = m.food or m.note or m.display
-                spec = m.spec()
-                await self.bring.remove_item(name=twin.name, item_uuid=row.bring_uuid)
-                new_uuid, bhash = await self._create_in_bring(m)
-                # Keep the in-memory snapshot consistent so the Bring->Mealie
-                # pass links the fresh uuid instead of re-importing the stale one
-                # as a brand-new item.
-                bring_items.remove(twin)
-                bring_by_uuid.pop(row.bring_uuid, None)
-                snapshot = BringItem(uuid=new_uuid, name=name, spec=spec, completed=False)
-                bring_items.append(snapshot)
-                bring_by_uuid[new_uuid] = snapshot
-                row.bring_uuid = new_uuid
-                row.bring_hash = bhash
-                row.mealie_hash = new_hash
-                # Recreate is the one non-idempotent action (a real delete + add
-                # on Bring). Persist the new mapping right away so a crash later
-                # in the cycle can't roll it back and make the next cycle recreate
-                # the item again — the failure mode that multiplied items.
-                db.commit()
-                self._emit(
-                    "updated", "mealie.renamed->bring.recreate",
-                    item=m.display, old=twin.name, destructive=True,
-                )
+            # Both sides live → three-way merge on transitions only.
+            if self._too_fresh(m, now):
+                continue  # edited mid-write; pick it up next cycle
+            if row.norm_key != m.norm_key:
+                row.norm_key = m.norm_key
+            mealie_changed = _mealie_hash(m) != row.mealie_hash
+            bring_changed = b.content_hash() != row.bring_hash
+            if not mealie_changed and not bring_changed:
                 continue
+            if bring_changed and not mealie_changed:
+                await self._converge_bring_to_mealie(row, m, b)
+            elif mealie_changed and not bring_changed:
+                await self._converge_mealie_to_bring(db, row, m, b, claimed_b)
             else:
-                spec = m.spec()
-                await self.bring.update_spec(name=m.food or m.display, spec=spec, item_uuid=row.bring_uuid)
-                row.bring_hash = _bring_hash(completed=False, spec=spec)
-                self._emit("updated", "mealie.changed->bring.spec", item=m.display)
-            row.mealie_hash = new_hash
+                # Both changed (rare). Honor an explicit Bring completion — the
+                # shopper physically checked it — otherwise Mealie is authority.
+                if b.completed:
+                    await self._converge_bring_to_mealie(row, m, b)
+                else:
+                    await self._converge_mealie_to_bring(db, row, m, b, claimed_b)
 
-        # Mealie removed (had mapping, now absent) → propagate + tombstone.
-        for row in db.scalars(select(ItemMap).where(ItemMap.mealie_id.is_not(None))).all():
-            if row.mealie_id in seen or row.deleted_at is not None:
+        # ── Stage 2a: unmapped Mealie items → link or create in Bring ─
+        for m in mealie_items:
+            if m.id in claimed_m or self._too_fresh(m, now):
                 continue
-            if row.bring_uuid:
-                await self.bring.remove_item(name=row.norm_key, item_uuid=row.bring_uuid)
-            row.deleted_at = now
-            # Always a hard delete on the Bring side — tag it as irreversible.
-            self._emit("removed", "mealie.removed->bring.remove", item=row.norm_key, destructive=True)
+            twin = pop_bring(m.norm_key)
+            if twin is not None:
+                mhash = _mealie_hash(m)
+                # Pre-existing pair whose Mealie side is checked-off but Bring
+                # side is active → uncheck so Mealie mirrors the live Bring list.
+                if not twin.completed and m.checked:
+                    updated = await self.mealie.set_checked(m.id, False)
+                    mhash = _mealie_hash(updated)
+                    self._emit("updated", "bring.active->mealie.uncheck", item=m.display)
+                db.add(ItemMap(
+                    mealie_id=m.id, bring_uuid=twin.uuid, norm_key=m.norm_key,
+                    mealie_hash=mhash, bring_hash=twin.content_hash(),
+                ))
+                self._emit("linked", "link.mealie+bring", item=m.display)
+            else:
+                new_uuid, bhash = await self._create_in_bring(m)
+                db.add(ItemMap(
+                    mealie_id=m.id, bring_uuid=new_uuid, norm_key=m.norm_key,
+                    mealie_hash=_mealie_hash(m), bring_hash=bhash,
+                ))
+                self._emit("created", "mealie.added->bring", item=m.display)
+            claimed_m.add(m.id)
+
+        # ── Stage 2b: unmapped Bring items → link or create in Mealie ─
+        for b in bring_items:
+            if b.uuid in claimed_b:
+                continue
+            twin = pop_mealie(b.norm_key)
+            if twin is not None:
+                mhash = _mealie_hash(twin)
+                # Bring wants this item active but Mealie has it checked-off →
+                # uncheck so the mirror matches the live Bring list.
+                if not b.completed and twin.checked:
+                    updated = await self.mealie.set_checked(twin.id, False)
+                    mhash = _mealie_hash(updated)
+                    self._emit("updated", "bring.active->mealie.uncheck", item=b.name)
+                db.add(ItemMap(
+                    mealie_id=twin.id, bring_uuid=b.uuid, norm_key=b.norm_key,
+                    mealie_hash=mhash, bring_hash=b.content_hash(),
+                ))
+                self._emit("linked", "link.bring+mealie", item=b.name)
+            elif b.completed:
+                # Arrived already-completed with no history → just record it.
+                db.add(ItemMap(bring_uuid=b.uuid, norm_key=b.norm_key, bring_hash=b.content_hash()))
+            else:
+                created = await self._create_in_mealie(b, units)
+                db.add(ItemMap(
+                    mealie_id=created.id, bring_uuid=b.uuid, norm_key=b.norm_key,
+                    mealie_hash=_mealie_hash(created), bring_hash=b.content_hash(),
+                ))
+                self._emit("created", "bring.added->mealie", item=b.name)
+            claimed_b.add(b.uuid)
+
+    async def _converge_mealie_to_bring(
+        self, db: Session, row: ItemMap, m: MealieItem, b: BringItem, claimed_b: set[str]
+    ) -> None:
+        """Push Mealie's state onto its live Bring twin; write both shadow hashes."""
+        new_mhash = _mealie_hash(m)
+        if m.checked:
+            # Ensure the Bring twin is completed (idempotent — skip if already).
+            if not b.completed:
+                await self.bring.complete_item(name=m.food or m.display, item_uuid=row.bring_uuid)
+            # Completing doesn't change Bring's spec, so hash the item's *actual*
+            # spec, not m.spec() (which may render differently).
+            row.bring_hash = _bring_hash(completed=True, spec=b.spec)
+            self._emit("updated", "mealie.checked->bring.complete", item=m.display)
+        elif b.norm_key != m.norm_key:
+            # On Bring the item *name* is its identity (itemId) and can't be
+            # renamed in place, so a changed name — a food rename or a corrected
+            # note — is mirrored as delete + recreate. A mere quantity change
+            # keeps ``norm_key`` stable and never lands here.
+            await self.bring.remove_item(name=b.name, item_uuid=row.bring_uuid)
+            new_uuid, bhash = await self._create_in_bring(m)
+            claimed_b.add(new_uuid)  # keep the fresh uuid out of the new-item stage
+            row.bring_uuid = new_uuid
+            row.bring_hash = bhash
+            row.mealie_hash = new_mhash
+            # Recreate is the one non-idempotent action (a real delete + add on
+            # Bring). Persist immediately so a later crash can't roll it back and
+            # make the next cycle recreate the item again.
+            db.commit()
+            self._emit(
+                "updated", "mealie.renamed->bring.recreate",
+                item=m.display, old=b.name, destructive=True,
+            )
+            return
+        else:
+            spec = m.spec()
+            await self.bring.update_spec(name=m.food or m.display, spec=spec, item_uuid=row.bring_uuid)
+            row.bring_hash = _bring_hash(completed=False, spec=spec)
+            self._emit("updated", "mealie.changed->bring.spec", item=m.display)
+        row.mealie_hash = new_mhash
+
+    async def _converge_bring_to_mealie(self, row: ItemMap, m: MealieItem, b: BringItem) -> None:
+        """Push Bring's state onto its Mealie twin.
+
+        The shadow is written from the item Mealie *actually persisted* (the
+        ``set_checked`` read-back), never an optimistic guess — the invariant
+        that stops the completed→resurrect and checked-state ping-pong loops.
+        """
+        if b.completed:
+            if settings.on_complete == "delete":
+                await self.mealie.delete_item(row.mealie_id)
+                row.deleted_at = utcnow()
+                self._emit("updated", "bring.completed->mealie.delete", item=b.name, destructive=True)
+            else:
+                updated = await self.mealie.set_checked(row.mealie_id, True)
+                row.mealie_hash = _mealie_hash(updated)
+                self._emit("updated", "bring.completed->mealie.check", item=b.name)
+        elif m.checked:
+            # Bring item is active but Mealie shows it checked → uncheck so
+            # Mealie mirrors the live Bring list.
+            updated = await self.mealie.set_checked(row.mealie_id, False)
+            row.mealie_hash = _mealie_hash(updated)
+            self._emit("updated", "bring.active->mealie.uncheck", item=b.name)
+        row.bring_hash = b.content_hash()
 
     # ── Bring → Mealie ──────────────────────────────────────────────
     async def _create_in_mealie(self, b: BringItem, units: dict[str, str]) -> MealieItem:
@@ -309,114 +436,6 @@ class Reconciler:
 
         note = f"{remainder} {b.name}".strip() if remainder else b.name
         return await self.mealie.create_item(note=note, quantity=quantity)
-
-    async def _reconcile_bring_to_mealie(
-        self, db: Session, bring_items: list[BringItem], mealie_items: list[MealieItem], units: dict[str, str]
-    ) -> None:
-        mealie_by_norm: dict[str, MealieItem] = {}
-        mealie_by_id: dict[str, MealieItem] = {}
-        for m in mealie_items:
-            mealie_by_norm.setdefault(m.norm_key, m)
-            mealie_by_id[m.id] = m
-
-        seen: set[str] = set()
-
-        for b in bring_items:
-            seen.add(b.uuid)
-            new_hash = b.content_hash()
-            row = self._by_bring(db, b.uuid) or self._by_norm(db, b.norm_key)
-
-            if row is None:
-                twin = mealie_by_norm.get(b.norm_key)
-                if twin is not None and self._by_mealie(db, twin.id) is None:
-                    mhash = _mealie_hash(twin)
-                    # Bring wants an item that's checked-off in Mealie → uncheck
-                    # it so the mirror matches the live (active) Bring list.
-                    if not b.completed and twin.checked:
-                        await self.mealie.set_checked(twin.id, False)
-                        mhash = _mealie_hash(replace(twin, checked=False))
-                        self._emit("updated", "bring.active->mealie.uncheck", item=b.name)
-                    db.add(ItemMap(
-                        mealie_id=twin.id, bring_uuid=b.uuid, norm_key=b.norm_key,
-                        mealie_hash=mhash, bring_hash=new_hash,
-                    ))
-                    self._emit("linked", "link.bring+mealie", item=b.name)
-                    continue
-                if b.completed:
-                    # Arrived already-completed with no history → just record it.
-                    db.add(ItemMap(bring_uuid=b.uuid, norm_key=b.norm_key, bring_hash=new_hash))
-                    continue
-                created = await self._create_in_mealie(b, units)
-                db.add(ItemMap(
-                    mealie_id=created.id, bring_uuid=b.uuid, norm_key=b.norm_key,
-                    mealie_hash=_mealie_hash(created), bring_hash=new_hash,
-                ))
-                self._emit("created", "bring.added->mealie", item=b.name)
-                continue
-
-            row.bring_uuid = b.uuid
-
-            # Heal a mapping that lost/never had its Mealie side.
-            if row.mealie_id is None and not b.completed:
-                twin = mealie_by_norm.get(b.norm_key)
-                if twin is not None and self._by_mealie(db, twin.id) is None:
-                    row.mealie_id = twin.id
-                    # Active Bring item linked to a checked-off Mealie twin →
-                    # uncheck so the mirror matches the live Bring list.
-                    if twin.checked:
-                        await self.mealie.set_checked(twin.id, False)
-                        twin = replace(twin, checked=False)
-                        self._emit("updated", "bring.active->mealie.uncheck", item=b.name)
-                    row.mealie_hash = _mealie_hash(twin)
-                    self._emit("healed", "heal.link_mealie", item=b.name)
-                else:
-                    created = await self._create_in_mealie(b, units)
-                    row.mealie_id = created.id
-                    row.mealie_hash = _mealie_hash(created)
-                    self._emit("healed", "heal.create_mealie", item=b.name)
-                row.bring_hash = new_hash
-                continue
-
-            if row.bring_hash == new_hash:
-                continue
-
-            if b.completed and row.mealie_id:
-                if settings.on_complete == "delete":
-                    await self.mealie.delete_item(row.mealie_id)
-                    row.deleted_at = utcnow()
-                    self._emit("updated", "bring.completed->mealie.delete", item=b.name, destructive=True)
-                else:
-                    await self.mealie.set_checked(row.mealie_id, True)
-                    # Record the Mealie side as checked too, so the Mealie->Bring
-                    # pass doesn't re-detect it and bounce the check back.
-                    m = mealie_by_id.get(row.mealie_id)
-                    if m is not None:
-                        row.mealie_hash = _mealie_hash(replace(m, checked=True))
-                    self._emit("updated", "bring.completed->mealie.check", item=b.name)
-            elif not b.completed and row.mealie_id:
-                # Bring item is active but its Mealie twin is checked-off →
-                # uncheck it so Mealie mirrors the live Bring list.
-                m = mealie_by_id.get(row.mealie_id)
-                if m is not None and m.checked:
-                    await self.mealie.set_checked(row.mealie_id, False)
-                    row.mealie_hash = _mealie_hash(replace(m, checked=False))
-                    self._emit("updated", "bring.active->mealie.uncheck", item=b.name)
-            row.bring_hash = new_hash
-
-        # Bring removed entirely (had mapping) → propagate + tombstone.
-        for row in db.scalars(select(ItemMap).where(ItemMap.bring_uuid.is_not(None))).all():
-            if row.bring_uuid in seen or row.deleted_at is not None:
-                continue
-            deleted = settings.on_complete == "delete"
-            if row.mealie_id:
-                if deleted:
-                    await self.mealie.delete_item(row.mealie_id)
-                else:
-                    await self.mealie.set_checked(row.mealie_id, True)
-            row.deleted_at = utcnow()
-            # Tag as destructive only when it actually deletes in Mealie; a
-            # check is reversible and part of normal completion.
-            self._emit("removed", "bring.removed->mealie", item=row.norm_key, destructive=deleted)
 
 
 
