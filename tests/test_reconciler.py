@@ -127,6 +127,39 @@ class TestMealieToBring:
         assert b2.name == "Eier"  # itemId preserved, not renamed to "12 Eier"
         assert b2.spec == "12"
 
+    async def test_food_with_unit_weight_change_updates_spec(self, cycle, db, mealie, bring):
+        """A weight change on a food item that has a unit (500 g -> 750 g)
+        updates the Bring spec in place; the food name stays the itemId."""
+        m = mealie.seed(food="Flour", quantity=500, unit="g")
+        await cycle()
+        (b,) = list(bring.items.values())
+        assert b.name == "Flour"
+        assert b.spec == "500 g"
+
+        mealie.set_quantity(m.id, 750)
+        await cycle()
+
+        assert bring.count("update_spec") == 1
+        assert bring.count("add_item") == 1
+        assert bring.count("remove_item") == 0
+        (b2,) = list(bring.items.values())
+        assert b2.name == "Flour"
+        assert b2.spec == "750 g"
+
+    async def test_unit_change_updates_spec(self, cycle, db, mealie, bring):
+        """Changing the unit (g -> kg) at the same quantity is still a transition."""
+        from dataclasses import replace
+
+        m = mealie.seed(food="Flour", quantity=1, unit="g")
+        await cycle()
+        mealie.items[m.id] = replace(mealie.items[m.id], unit="kg")
+        await cycle()
+
+        assert bring.count("update_spec") == 1
+        (b,) = list(bring.items.values())
+        assert b.spec == "1 kg"
+
+
     async def test_rename_recreates_bring_item(self, cycle, db, mealie, bring):
         m = mealie.seed(note="Milk", quantity=1)
         await cycle()

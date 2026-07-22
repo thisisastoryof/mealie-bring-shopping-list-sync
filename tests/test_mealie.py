@@ -137,3 +137,53 @@ class TestCreateItemMerge:
             item = await client.create_item(note="Milk", quantity=2)
         assert item.id == "x"
         assert item.note == "Milk"
+
+
+class TestRealSchemaShapes:
+    """Guard against Mealie schema drift using the real ShoppingListItemOut /
+    IngredientUnit-Output shapes from the OpenAPI spec (demo.mealie.io)."""
+
+    def _food_with_unit(self):
+        # Mirrors ShoppingListItemOut-Output for "500 g Flour".
+        return {
+            "id": "sli-1",
+            "shoppingListId": "list-1",
+            "quantity": 500,
+            "unit": {
+                "id": "u-1",
+                "name": "gram",
+                "pluralName": "grams",
+                "abbreviation": "g",
+                "pluralAbbreviation": "g",
+                "useAbbreviation": True,
+                "fraction": True,
+            },
+            "food": {"id": "f-1", "name": "Flour", "pluralName": "Flour"},
+            "note": "",
+            "display": "500 g Flour",
+            "checked": False,
+            "foodId": "f-1",
+            "unitId": "u-1",
+            "labelId": None,
+            "position": 0,
+        }
+
+    def test_food_unit_quantity_extracted(self):
+        item = _to_item(self._food_with_unit())
+        assert item.quantity == 500
+        assert item.unit == "g"  # useAbbreviation → abbreviation
+        assert item.food == "Flour"
+        assert item.note is None  # "" normalizes to None
+        assert item.spec() == "500 g"
+        assert item.norm_key == "flour"
+
+    def test_weight_change_is_a_transition(self):
+        from app.services.reconciler import _mealie_hash
+
+        before = _to_item(self._food_with_unit())
+        raw_after = self._food_with_unit()
+        raw_after["quantity"] = 750
+        after = _to_item(raw_after)
+        assert after.spec() == "750 g"
+        assert _mealie_hash(before) != _mealie_hash(after)
+
