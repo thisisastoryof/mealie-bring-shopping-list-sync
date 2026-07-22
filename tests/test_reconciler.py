@@ -102,6 +102,31 @@ class TestMealieToBring:
         assert b.spec == "3"
         assert b.completed is False
 
+    async def test_note_item_quantity_change_keeps_bring_name(self, cycle, db, mealie, bring):
+        """Regression: a note item's display carries the quantity ("12 Eier").
+
+        A spec-only change must update the Bring spec in place and never rename
+        the itemId to the display string.
+        """
+        from dataclasses import replace
+
+        m = mealie.seed(note="Eier", quantity=10)
+        await cycle()
+        (b,) = list(bring.items.values())
+        assert b.name == "Eier"
+        assert b.spec == "10"
+
+        # Real Mealie recomputes display to include the quantity.
+        mealie.items[m.id] = replace(mealie.items[m.id], quantity=12, display="12 Eier")
+        await cycle()
+
+        assert bring.count("update_spec") == 1
+        assert bring.count("add_item") == 1  # spec update, not a recreate
+        assert bring.count("remove_item") == 0
+        (b2,) = list(bring.items.values())
+        assert b2.name == "Eier"  # itemId preserved, not renamed to "12 Eier"
+        assert b2.spec == "12"
+
     async def test_rename_recreates_bring_item(self, cycle, db, mealie, bring):
         m = mealie.seed(note="Milk", quantity=1)
         await cycle()

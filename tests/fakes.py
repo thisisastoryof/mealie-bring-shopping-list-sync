@@ -105,8 +105,10 @@ class FakeBring:
     async def update_spec(self, *, name: str, spec: str, item_uuid: str) -> None:
         self.calls.append(("update_spec", name, spec, item_uuid))
         cur = self.items[item_uuid]
-        # save_item re-activates an item, matching real Bring behaviour.
-        self.items[item_uuid] = replace(cur, spec=spec, completed=False)
+        # save_item overwrites the itemId with whatever name is passed and
+        # re-activates the item — matching real Bring behaviour, so passing the
+        # wrong name here would rename the item.
+        self.items[item_uuid] = replace(cur, name=name, spec=spec, completed=False)
 
     async def complete_item(self, *, name: str, item_uuid: str) -> None:
         self.calls.append(("complete_item", name, item_uuid))

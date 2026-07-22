@@ -357,8 +357,11 @@ class Reconciler:
         new_mhash = _mealie_hash(m)
         if m.checked:
             # Ensure the Bring twin is completed (idempotent — skip if already).
+            # Pass the twin's *existing* itemId (b.name), never m.display: for a
+            # note item the display carries the quantity ("12 Eier") and Bring's
+            # save_item would rename the item to it.
             if not b.completed:
-                await self.bring.complete_item(name=m.food or m.display, item_uuid=row.bring_uuid)
+                await self.bring.complete_item(name=b.name, item_uuid=row.bring_uuid)
             # Completing doesn't change Bring's spec, so hash the item's *actual*
             # spec, not m.spec() (which may render differently).
             row.bring_hash = _bring_hash(completed=True, spec=b.spec)
@@ -384,8 +387,11 @@ class Reconciler:
             )
             return
         else:
+            # A spec-only change (e.g. quantity 10 -> 12). Reuse the twin's
+            # existing itemId (b.name) so Bring updates the spec in place and
+            # never renames — a note item's m.display would carry the quantity.
             spec = m.spec()
-            await self.bring.update_spec(name=m.food or m.display, spec=spec, item_uuid=row.bring_uuid)
+            await self.bring.update_spec(name=b.name, spec=spec, item_uuid=row.bring_uuid)
             row.bring_hash = _bring_hash(completed=False, spec=spec)
             self._emit("updated", "mealie.changed->bring.spec", item=m.display)
         row.mealie_hash = new_mhash
